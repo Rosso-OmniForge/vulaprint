@@ -1,0 +1,2 @@
+echo -e "SIZE 40 mm,30 mm\nGAP 2 mm,0\nCLS\nTEXT 50,10,\"3\",0,1,1,\"Vula! Print\"\nBAR 20,40,280,2\nTEXT 20,50,\"2\",0,1,1,\"Al Maisa Cape - Blk\"\nTEXT 20,80,\"3\",0,1,1,\"R 950.00\"\nBOX 260,75,300,105,2\nTEXT 270,80,\"2\",0,1,1,\"L\"\nBARCODE 0,120,\"39\",70,0,0,1,2,\"99001\"\nTEXT 0,200,\"1\",0,1,1,\"ALM-CAP-SIN-BLK-L\"\nPRINT 1\n" | sudo tee /dev/usb/lp2
+
