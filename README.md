@@ -12,6 +12,8 @@ A modern, branded desktop application for printing product labels directly from 
 - 🚀 **Auto-Start + Auto-Connect**: Starts at login and reconnects to saved API URL
 - ✅ **Modern UI**: Clean, branded PyQt6 interface
 - 🔒 **Secure**: API key authentication
+- 🧾 **POS Slip Printing**: Auto-polls POS queue and prints slips with cutter support
+- 🧪 **Test POS Printer**: Prints a 6-item sample receipt for roll-change and update checks
 - 📊 **Real-time Progress**: Live printing progress with status updates
 
 ### Installation
@@ -35,8 +37,9 @@ This will:
 1. Install system dependencies (Python, PyQt6, USB libraries)
 2. Create a Python virtual environment
 3. Install all required Python packages
-4. Make the application executable
-5. Create desktop autostart entry (`~/.config/autostart/vula-print.desktop`)
+4. Prompt for Vula API Base URL and API Key
+5. Write secure runtime config to `.env` (permissions `600`)
+6. Install and start the systemd user service
 
 ### Running the Application
 
@@ -53,29 +56,48 @@ source venv/bin/activate
 python3 vula_print_app.py
 ```
 
-### Startup on Boot (Desktop Login)
+### Startup on Boot (systemd user service)
 
-The installer creates this autostart file:
+The installer creates and enables this user service:
 
 ```bash
-~/.config/autostart/vula-print.desktop
+~/.config/systemd/user/vula-print.service
 ```
 
-To disable autostart:
+Useful commands:
 
 ```bash
-rm ~/.config/autostart/vula-print.desktop
+systemctl --user status vula-print
+systemctl --user restart vula-print
+systemctl --user stop vula-print
 ```
 
 ### Configuration
 
-1. **API Server URL**: Enter the backend server URL (default: `http://localhost:8000`)
-   - URL is saved automatically and restored on next launch
-   - App attempts automatic API connection on startup
-2. **API Key**: Configured in the application (default: `VULA-PRINTER-2026-SECURE-KEY`)
-   - For production, update the API key in both:
-     - `vula_print_app.py` (line ~21)
-     - Backend: `backend/app/routes/label_printing.py` (line ~307)
+The app reads backend configuration from `.env` in the project root.
+
+On install, you are prompted for:
+- `PRINTER_API_BASE_URL`
+- `PRINTER_API_KEY`
+
+The installer writes these values into `.env` before starting the service.
+
+Manual setup (optional):
+
+```bash
+cp .env.example .env
+```
+
+1. Set required values in `.env`:
+   - `PRINTER_API_BASE_URL`
+   - `PRINTER_API_KEY`
+   - `PRINTER_USER_ID` (required for POS queue routing)
+
+2. In the app UI:
+   - Select the **Label printer** and **POS slip printer** separately.
+   - Verify **PRINTER USER ID** is set correctly.
+   - Use **Test Connection** to validate backend connectivity.
+   - Use **Test POS Printer** to print/cut a 6-item sample slip.
 
 ### Usage Guide
 
@@ -91,9 +113,10 @@ rm ~/.config/autostart/vula-print.desktop
    - Click "Scan for Printers"
    - Select your printer from the dropdown
 
-3. **Configure API**
-   - Enter your backend server URL
-   - Click "Test API Connection"
+3. **Configure API + POS Routing**
+   - Ensure `.env` has API URL/key and `PRINTER_USER_ID`
+   - In app, select POS slip printer device
+   - Click "Test Connection"
    - Verify connection is successful (green indicator)
 
 4. **Calibrate Printer**
@@ -115,6 +138,18 @@ rm ~/.config/autostart/vula-print.desktop
    - Click the "🖨️ Print" button for the desired request
    - Monitor progress in the progress bar
    - Request will be marked as completed automatically
+
+#### Printing POS Slips
+
+1. **Auto Mode**
+   - POS worker polls every 5 seconds.
+   - When pending slips exist for `PRINTER_USER_ID`, they are printed automatically.
+   - Slip is completed on backend only after successful print write.
+
+2. **Test Mode**
+   - Click **Test POS Printer**.
+   - App prints sample slip with 6 items and performs cut.
+   - Use this after paper roll changes or app updates.
 
 ### UI Design
 
@@ -189,21 +224,22 @@ pip install --no-deps PyQt6
 - `GET /admin/api/label-printing/pending` - Fetch pending requests
 - `GET /admin/api/label-printing/request/{id}` - Get request details
 - `POST /admin/api/label-printing/complete` - Mark request as completed
+- `GET /admin/api/pos-slips/pending` - Fetch pending POS slips
+- `GET /admin/api/pos-slips/request/{id}` - Fetch POS slip detail payload
+- `POST /admin/api/pos-slips/complete` - Mark POS slip as completed
 
 ### Security Notes
 
-⚠️ **Important**: Change the default API key before deploying to production!
+⚠️ **Important**: Never commit production API keys.
 
 1. Generate a secure random key:
    ```bash
    openssl rand -base64 32
    ```
 
-2. Update in both:
-   - Desktop app: `vula_print_app.py`
-   - Backend: `backend/app/routes/label_printing.py`
+2. Set it in `.env` as `PRINTER_API_KEY`.
 
-3. Consider using environment variables for the API key
+3. Keep backend key and app key aligned.
 
 ### Development
 

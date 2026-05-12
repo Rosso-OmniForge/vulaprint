@@ -7,6 +7,15 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# ── Local environment file ───────────────────────────────────────
+# Loads PRINTER_API_KEY / PRINTER_API_BASE_URL / PRINTER_USER_ID
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
 # ── Display environment ──────────────────────────────────────────
 # When launched by systemd the DISPLAY / WAYLAND_DISPLAY variables may
 # not be set yet.  We try three strategies in order:

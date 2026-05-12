@@ -10,6 +10,8 @@
 
 set -e
 
+DEFAULT_API_BASE_URL="https://shop.novaconv.co.za"
+
 # ──────────────────────────────────────────────────────────────────
 # Resolve the REAL user and their home, regardless of whether the
 # script was invoked with or without sudo.
@@ -44,6 +46,76 @@ apt_install() {
     else
         sudo apt-get "$@"
     fi
+}
+
+# Helper: trim leading/trailing whitespace.
+trim() {
+    local s="$1"
+    # shellcheck disable=SC2001
+    s="$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    printf '%s' "$s"
+}
+
+# Prompt for backend settings and write .env (or use env vars for non-interactive runs).
+configure_vula_env() {
+    local env_file="$SCRIPT_DIR/.env"
+    local existing_user_id=""
+    local input_url=""
+    local input_key=""
+
+    if [ -f "$env_file" ]; then
+        existing_user_id="$(grep -E '^PRINTER_USER_ID=' "$env_file" | tail -n1 | cut -d'=' -f2-)"
+    fi
+    existing_user_id="$(trim "$existing_user_id")"
+    [ -n "$existing_user_id" ] || existing_user_id="1"
+
+    if [ -n "$PRINTER_API_BASE_URL" ] || [ -n "$PRINTER_API_KEY" ]; then
+        input_url="$(trim "${PRINTER_API_BASE_URL:-$DEFAULT_API_BASE_URL}")"
+        input_key="$(trim "${PRINTER_API_KEY:-}")"
+        if [ -z "$input_key" ]; then
+            echo "❌ PRINTER_API_KEY env var was provided but is empty."
+            echo "   Set PRINTER_API_KEY and re-run installer."
+            exit 1
+        fi
+    elif [ -t 0 ]; then
+        echo ""
+        echo "🔑 Vula API Setup"
+        echo "   Configure backend access before starting the service."
+
+        while true; do
+            read -r -p "   API base URL [$DEFAULT_API_BASE_URL]: " input_url
+            input_url="$(trim "${input_url:-$DEFAULT_API_BASE_URL}")"
+            if [ -n "$input_url" ]; then
+                break
+            fi
+            echo "   API base URL is required."
+        done
+
+        while true; do
+            read -r -s -p "   API key: " input_key
+            echo ""
+            input_key="$(trim "$input_key")"
+            if [ -n "$input_key" ]; then
+                break
+            fi
+            echo "   API key is required."
+        done
+    else
+        echo "❌ Non-interactive install detected with no API credentials provided."
+        echo "   Re-run interactively or pass env vars:"
+        echo "   PRINTER_API_BASE_URL=https://shop.novaconv.co.za PRINTER_API_KEY=... bash install_printer_app.sh"
+        exit 1
+    fi
+
+    cat > "$env_file" <<EOF
+# Vula! Print app environment variables
+# Managed by install_printer_app.sh
+PRINTER_API_BASE_URL=$input_url
+PRINTER_API_KEY=$input_key
+PRINTER_USER_ID=$existing_user_id
+EOF
+    chmod 600 "$env_file"
+    echo "   ✓ Saved backend settings to $env_file"
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -167,6 +239,9 @@ chmod +x "$SCRIPT_DIR/launch_printer.sh"
 [ -f "$SCRIPT_DIR/update.sh" ]    && chmod +x "$SCRIPT_DIR/update.sh"
 [ -f "$SCRIPT_DIR/uninstall.sh" ] && chmod +x "$SCRIPT_DIR/uninstall.sh"
 
+# ── 5b. Configure backend credentials (.env) ─────────────────────
+configure_vula_env
+
 # Ensure the whole project directory is owned by the real user
 if [ "$EUID" -eq 0 ]; then
     chown -R "$REAL_USER":"$REAL_USER" "$SCRIPT_DIR"
@@ -247,4 +322,5 @@ echo "    Restart  →  systemctl --user restart ${SERVICE_NAME}"
 echo ""
 echo "  To update:   bash update.sh"
 echo "  To remove:   bash uninstall.sh"
+echo "  Env file:    $SCRIPT_DIR/.env"
 echo ""

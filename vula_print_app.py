@@ -7,8 +7,10 @@ Modern PyQt6 GUI for managing and printing label requests
 import sys
 import json
 import re
+import os
 import subprocess
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -26,9 +28,31 @@ from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen,
 import requests
 
 
+def _load_env_file(env_file: Path) -> None:
+    """Load simple KEY=VALUE pairs from .env into process environment."""
+    if not env_file.exists():
+        return
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception as e:
+        print(f"Warning: failed to load .env file {env_file}: {e}")
+
+
 # Configuration
-API_BASE_URL = "https://store.baytalemirati.co.za"  # Change to production URL
-API_KEY = "VULA-PRINTER-2026-SECURE-KEY"  # Should match backend
+APP_ROOT = Path(__file__).parent
+_load_env_file(APP_ROOT / ".env")
+
+API_BASE_URL = os.getenv("PRINTER_API_BASE_URL", "https://store.baytalemirati.co.za")
+API_KEY = os.getenv("PRINTER_API_KEY", "")
 APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
 APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
 
@@ -373,6 +397,176 @@ class PrintJob(QThread):
             self.finished.emit(False, f"Print job failed: {e}")
 
 
+class POSSlipPrintJob(QThread):
+    """Background thread for printing POS slips (ESC/POS)."""
+
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, printer_device: str, detail_payload: Dict[str, Any]):
+        super().__init__()
+        self.printer_device = printer_device
+        self.detail_payload = detail_payload
+
+    @staticmethod
+    def _cents_to_amount(cents: int) -> str:
+        value = Decimal(int(cents)) / Decimal(100)
+        value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{value:.2f}"
+
+    @staticmethod
+    def _vat_percent_from_bps(vat_bps: int) -> str:
+        value = Decimal(int(vat_bps)) / Decimal(100)
+        value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{value:.2f}%"
+
+    @staticmethod
+    def _esc(*values: int) -> bytes:
+        return bytes(values)
+
+    @staticmethod
+    def _line_sep(width: int = 48, ch: str = "-") -> str:
+        return ch * width
+
+    @staticmethod
+    def _col2(left: str, right: str, width: int = 48) -> str:
+        l = str(left or "")
+        r = str(right or "")
+        space = max(1, width - len(l) - len(r))
+        return f"{l}{' ' * space}{r}"
+
+    def _txt(self, text: str = "") -> bytes:
+        return (text + "\n").encode("ascii", errors="replace")
+
+    def _build_receipt_bytes(self) -> bytes:
+        req = self.detail_payload.get("request", {})
+        business = self.detail_payload.get("business", {})
+        store = self.detail_payload.get("store", {})
+        totals = self.detail_payload.get("totals", {})
+        items = self.detail_payload.get("items", [])
+
+        currency = totals.get("currency", "ZAR")
+        cur = "R" if currency == "ZAR" else currency
+
+        out = bytearray()
+        ESC = 0x1B
+        GS = 0x1D
+        LF = 0x0A
+
+        out += self._esc(ESC, 0x40)  # init
+        out += self._esc(ESC, 0x61, 0x01)  # center
+        out += self._esc(ESC, 0x45, 0x01)  # bold on
+        out += self._txt(business.get("brand_name", "POS RECEIPT"))
+        out += self._esc(ESC, 0x45, 0x00)  # bold off
+
+        if business.get("phone"):
+            out += self._txt(f"Tel: {business['phone']}")
+        if business.get("email"):
+            out += self._txt(str(business.get("email", "")))
+        if business.get("vat_number"):
+            out += self._txt(f"VAT: {business['vat_number']}")
+
+        addr_parts = [
+            business.get("address_line1", ""),
+            business.get("address_line2", ""),
+            business.get("city", ""),
+            business.get("province", ""),
+            business.get("postal_code", ""),
+            business.get("country", ""),
+        ]
+        for line in [p for p in addr_parts if p]:
+            out += self._txt(str(line))
+
+        out += self._esc(ESC, 0x61, 0x00)  # left
+        out += self._txt(self._line_sep())
+        out += self._txt(self._col2("Invoice:", str(req.get("invoice_number", ""))))
+        out += self._txt(self._col2("Created:", str(req.get("created_at", ""))))
+        out += self._txt(self._col2("Cashier:", str(self.detail_payload.get("cashier_username", ""))))
+        out += self._txt(self._col2("Payment:", str(req.get("payment_type", ""))))
+
+        customer_email = str(self.detail_payload.get("customer_email", "") or "").strip()
+        if customer_email:
+            out += self._txt(self._col2("Customer:", customer_email))
+
+        if store.get("name"):
+            out += self._txt(self._line_sep())
+            out += self._txt(str(store.get("name", "")))
+            for store_line in str(store.get("address", "")).splitlines():
+                if store_line.strip():
+                    out += self._txt(store_line.strip())
+            if store.get("phone"):
+                out += self._txt(f"Store Tel: {store['phone']}")
+            if store.get("email"):
+                out += self._txt(f"Store Email: {store['email']}")
+
+        out += self._txt(self._line_sep())
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt(self._col2("QTY ITEM", "TOTAL"))
+        out += self._esc(ESC, 0x45, 0x00)
+        out += self._txt(self._line_sep())
+
+        for item in items:
+            qty = int(item.get("qty", 0) or 0)
+            title = str(item.get("title", ""))
+            variant = str(item.get("variant_label", ""))
+            sku = str(item.get("sku", ""))
+            unit_price = f"{cur} {self._cents_to_amount(item.get('unit_price_cents', 0) or 0)}"
+            line_total = f"{cur} {self._cents_to_amount(item.get('line_total_cents', 0) or 0)}"
+
+            out += self._txt(self._col2(f"{qty} x {title[:26]}", line_total))
+            if variant:
+                out += self._txt(f"  {variant[:42]}")
+            if sku:
+                out += self._txt(f"  SKU: {sku[:36]}")
+            out += self._txt(f"  @ {unit_price}")
+
+        out += self._txt(self._line_sep())
+        out += self._txt(self._col2("Subtotal before disc:", f"{cur} {self._cents_to_amount(totals.get('subtotal_before_discount_cents', 0) or 0)}"))
+        out += self._txt(self._col2("Manual discount:", f"{cur} {self._cents_to_amount(totals.get('manual_discount_cents', 0) or 0)}"))
+        out += self._txt(self._col2("Voucher discount:", f"{cur} {self._cents_to_amount(totals.get('voucher_discount_cents', 0) or 0)}"))
+        out += self._txt(self._col2("Subtotal:", f"{cur} {self._cents_to_amount(totals.get('subtotal_cents', 0) or 0)}"))
+
+        vat_label = f"VAT ({self._vat_percent_from_bps(totals.get('vat_bps', 0) or 0)}):"
+        out += self._txt(self._col2(vat_label, f"{cur} {self._cents_to_amount(totals.get('tax_cents', 0) or 0)}"))
+        out += self._txt(self._line_sep())
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt(self._col2("TOTAL:", f"{cur} {self._cents_to_amount(totals.get('total_cents', 0) or 0)}"))
+        out += self._esc(ESC, 0x45, 0x00)
+
+        footer_note = str(self.detail_payload.get("footer_note", "") or "").strip()
+        if footer_note:
+            out += self._txt(self._line_sep())
+            out += self._esc(ESC, 0x61, 0x01)
+            out += self._txt(footer_note[:48])
+            out += self._esc(ESC, 0x61, 0x00)
+
+        out += bytes([LF, LF, LF])
+        out += self._esc(GS, 0x56, 0x41, 0x00)  # full cut
+        return bytes(out)
+
+    def run(self):
+        try:
+            payload = self._build_receipt_bytes()
+            try:
+                with open(self.printer_device, "wb") as printer:
+                    printer.write(payload)
+            except PermissionError:
+                self.finished.emit(
+                    False,
+                    f"Permission denied: cannot write to {self.printer_device}.\n\n"
+                    f"The printer device requires the user to be in the 'lp' group.\n"
+                    f"Re-run the install script to fix this automatically, or run:\n"
+                    f"  sudo usermod -aG lp $USER  (then log out and back in)",
+                )
+                return
+            except Exception as e:
+                self.finished.emit(False, f"POS printer error: {e}")
+                return
+
+            self.finished.emit(True, "POS slip printed successfully")
+        except Exception as e:
+            self.finished.emit(False, f"POS slip print failed: {e}")
+
+
 class VulaPrintApp(QMainWindow):
     """Main application window."""
     
@@ -382,12 +576,26 @@ class VulaPrintApp(QMainWindow):
         self.api_base_url = API_BASE_URL
         self.api_key = API_KEY
         self.selected_printer = None
+        self.pos_selected_printer = None
         self.printer_calibrated = False
         self.pending_requests: List[Dict[str, Any]] = []
         self.last_selected_printer: Optional[str] = None
+        self.last_selected_pos_printer: Optional[str] = None
         self.auto_connect_on_startup = True
+        self.printer_user_id: Optional[int] = None
+        self.pos_poll_interval_seconds = 5
+        env_user_id = os.getenv("PRINTER_USER_ID", "").strip()
+        if env_user_id.isdigit() and int(env_user_id) > 0:
+            self.printer_user_id = int(env_user_id)
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
+        self.pos_print_job: Optional[POSSlipPrintJob] = None
+        self.pos_in_flight_ids: set[int] = set()
+        self.pos_completion_retry_ids: set[int] = set()
+        self.pos_backoff_seconds = 1
+        self.pos_backoff_until = 0.0
+        self.last_successful_pos_poll_at: Optional[datetime] = None
+        self.last_successful_pos_print_at: Optional[datetime] = None
         self._selected_request: Optional[Dict[str, Any]] = None   # tracks table selection
         self._current_print_request: Optional[Dict[str, Any]] = None  # for history
 
@@ -410,8 +618,15 @@ class VulaPrintApp(QMainWindow):
                 data = json.load(f)
 
             self.api_base_url = (data.get("api_base_url") or self.api_base_url).strip()
-            self.last_selected_printer = data.get("label_printer_device") or None
+            roles = data.get("printer_roles") or {}
+            self.last_selected_printer = roles.get("label") or data.get("label_printer_device") or None
+            self.last_selected_pos_printer = roles.get("pos_slip") or data.get("pos_slip_printer_device") or None
             self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
+            raw_user_id = data.get("printer_user_id")
+            if raw_user_id is not None and str(raw_user_id).strip().isdigit():
+                parsed_user_id = int(str(raw_user_id).strip())
+                self.printer_user_id = parsed_user_id if parsed_user_id > 0 else None
+            self.pos_poll_interval_seconds = int(data.get("pos_poll_interval_seconds", 5) or 5)
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
 
@@ -422,10 +637,13 @@ class VulaPrintApp(QMainWindow):
             data = {
                 "api_base_url": self.api_base_url,
                 "label_printer_device": self.last_selected_printer,
+                "pos_slip_printer_device": self.last_selected_pos_printer,
                 "auto_connect_on_startup": self.auto_connect_on_startup,
+                "printer_user_id": self.printer_user_id,
+                "pos_poll_interval_seconds": self.pos_poll_interval_seconds,
                 "printer_roles": {
                     "label": self.last_selected_printer,
-                    "pos_slip": None,
+                    "pos_slip": self.last_selected_pos_printer,
                 },
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -460,31 +678,68 @@ class VulaPrintApp(QMainWindow):
 
     def check_api_connection(self, show_dialogs: bool = True, fetch_queue_on_success: bool = True) -> bool:
         """Check API connectivity and update status indicators."""
+        if not self.api_key:
+            self._set_connection_status(False)
+            self._update_pos_worker_status("Set PRINTER_API_KEY in .env")
+            if show_dialogs:
+                QMessageBox.warning(
+                    self,
+                    "Missing API Key",
+                    "PRINTER_API_KEY is not configured.\n"
+                    "Create .env from .env.example and set PRINTER_API_KEY.",
+                )
+            return False
+
         try:
             headers = {"X-API-Key": self.api_key}
-            response = requests.get(
+            label_response = requests.get(
                 f"{self.api_base_url}/admin/api/label-printing/pending",
                 headers=headers,
                 timeout=5
             )
 
-            if response.status_code == 200:
+            if label_response.status_code == 200:
                 self._set_connection_status(True)
                 if fetch_queue_on_success:
-                    self.pending_requests = response.json()
+                    self.pending_requests = label_response.json()
                     self.update_requests_table()
                     self.status_bar.showMessage(f"Loaded {len(self.pending_requests)} pending request(s)")
+
+                pos_status_msg = "POS pending check skipped (set PRINTER_USER_ID)"
+                if self.printer_user_id:
+                    pos_headers = self._pos_headers()
+                    pos_response = requests.get(
+                        f"{self.api_base_url}/admin/api/pos-slips/pending",
+                        headers=pos_headers,
+                        timeout=5,
+                    )
+                    if pos_response.status_code == 200:
+                        pos_status_msg = "POS API connected"
+                    elif pos_response.status_code == 400:
+                        pos_status_msg = "POS API rejected PRINTER_USER_ID"
+                    elif pos_response.status_code in (401, 503):
+                        pos_status_msg = f"POS API unavailable ({pos_response.status_code})"
+                    else:
+                        pos_status_msg = f"POS API error ({pos_response.status_code})"
+
+                self._update_pos_worker_status(pos_status_msg)
                 if show_dialogs:
-                    QMessageBox.information(self, "Connection Success", "Successfully connected to API server!")
+                    QMessageBox.information(
+                        self,
+                        "Connection Success",
+                        f"Label API connected successfully.\n{pos_status_msg}",
+                    )
                 return True
 
-            self._set_connection_status(False, status_code=response.status_code)
+            self._set_connection_status(False, status_code=label_response.status_code)
+            self._update_pos_worker_status(f"Label API error ({label_response.status_code})")
             if show_dialogs:
-                QMessageBox.warning(self, "Connection Error", f"Server returned: {response.status_code}")
+                QMessageBox.warning(self, "Connection Error", f"Server returned: {label_response.status_code}")
             return False
 
         except Exception as e:
             self._set_connection_status(False)
+            self._update_pos_worker_status("Connection failed")
             if show_dialogs:
                 QMessageBox.critical(self, "Connection Failed", f"Failed to connect: {e}")
             return False
@@ -514,13 +769,38 @@ class VulaPrintApp(QMainWindow):
     C_WARNING   = "#e09a2a"   # warning
     C_SIDEBAR   = "#13161c"   # sidebar
 
-    SIDEBAR_W   = 220         # fixed sidebar width px
+    SIDEBAR_W   = 220
+    SIDEBAR_MIN_W = 170
+    SIDEBAR_MAX_W = 280
+
+    def _screen_size(self) -> QSize:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return QSize(1366, 768)
+        return screen.availableGeometry().size()
+
+    def _responsive_sidebar_width(self) -> int:
+        width = self.width() if self.width() > 0 else self._screen_size().width()
+        if width <= 980:
+            return 178
+        if width >= 1900:
+            return 258
+        return 220
+
+    def _dialog_size(self, width_ratio: float, height_ratio: float, min_w: int, min_h: int, max_w: int, max_h: int) -> QSize:
+        screen_size = self._screen_size()
+        desired_w = max(min_w, min(int(screen_size.width() * width_ratio), max_w))
+        desired_h = max(min_h, min(int(screen_size.height() * height_ratio), max_h))
+        return QSize(desired_w, desired_h)
 
     def init_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle("Vula! Print · Print Manager")
-        self.setMinimumSize(1100, 700)
-        self.resize(1340, 820)
+        screen_size = self._screen_size()
+        min_w = max(920, int(screen_size.width() * 0.62))
+        min_h = max(620, int(screen_size.height() * 0.72))
+        self.setMinimumSize(min_w, min_h)
+        self.resize(min(1500, int(screen_size.width() * 0.86)), min(960, int(screen_size.height() * 0.9)))
 
         logo_path = Path(__file__).parent / "assets" / "Vula_Logo.png"
         if logo_path.exists():
@@ -618,6 +898,9 @@ class VulaPrintApp(QMainWindow):
     # ── Sidebar ───────────────────────────────────────────────────
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
+        self.SIDEBAR_W = self._responsive_sidebar_width()
+        sidebar.setMinimumWidth(self.SIDEBAR_MIN_W)
+        sidebar.setMaximumWidth(self.SIDEBAR_MAX_W)
         sidebar.setFixedWidth(self.SIDEBAR_W)
         sidebar.setStyleSheet(f"QWidget {{ background:{self.C_SIDEBAR}; }}")
 
@@ -637,7 +920,7 @@ class VulaPrintApp(QMainWindow):
         logo_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
         assets = Path(__file__).parent / "assets"
-        logo_w = self.SIDEBAR_W - 36   # constant inner width for both images
+        logo_w = max(120, self.SIDEBAR_W - 36)
 
         def _make_logo_label(img_path: Path) -> QLabel:
             lbl = QLabel()
@@ -683,6 +966,11 @@ class VulaPrintApp(QMainWindow):
         self.printer_combo.currentIndexChanged.connect(self.on_printer_selected)
         self.printer_combo.setStyleSheet(self._input_style())
 
+        self.pos_printer_combo = QComboBox()
+        self.pos_printer_combo.addItem("No POS printer detected")
+        self.pos_printer_combo.currentIndexChanged.connect(self.on_pos_printer_selected)
+        self.pos_printer_combo.setStyleSheet(self._input_style())
+
         # calibration status pill
         self.calibration_status = QLabel("Not calibrated")
         self.calibration_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -706,11 +994,18 @@ class VulaPrintApp(QMainWindow):
         test_label_btn.setStyleSheet(self._btn_secondary())
         test_label_btn.clicked.connect(self.print_test_label_standalone)
 
+        test_pos_btn = QPushButton("Test POS Printer")
+        test_pos_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_pos_btn.setStyleSheet(self._btn_secondary())
+        test_pos_btn.clicked.connect(self.print_test_pos_slip)
+
         pc_layout.addWidget(self.printer_combo)
+        pc_layout.addWidget(self.pos_printer_combo)
         pc_layout.addWidget(self.calibration_status)
         pc_layout.addWidget(scan_btn)
         pc_layout.addWidget(calibrate_btn)
         pc_layout.addWidget(test_label_btn)
+        pc_layout.addWidget(test_pos_btn)
         config_layout.addWidget(printer_card)
 
         # ── Connection card ─────────────────────────────
@@ -737,6 +1032,20 @@ class VulaPrintApp(QMainWindow):
         self.api_url_input.setStyleSheet(self._input_style())
         self.api_url_input.textChanged.connect(self.on_api_url_changed)
 
+        user_id_lbl = QLabel("PRINTER USER ID")
+        user_id_lbl.setStyleSheet(self._label_style(small=True))
+        self.printer_user_id_input = QLineEdit("" if self.printer_user_id is None else str(self.printer_user_id))
+        self.printer_user_id_input.setPlaceholderText("Required integer > 0")
+        self.printer_user_id_input.setStyleSheet(self._input_style())
+        self.printer_user_id_input.textChanged.connect(self.on_printer_user_id_changed)
+
+        self.pos_worker_status = QLabel("POS worker paused")
+        self.pos_worker_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pos_worker_status.setStyleSheet(
+            f"background:#2a1f1a; color:{self.C_WARNING}; border:1px solid #5a3b2a;"
+            f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+        )
+
         connect_btn = QPushButton("Test Connection")
         connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         connect_btn.setStyleSheet(self._btn_secondary())
@@ -745,6 +1054,9 @@ class VulaPrintApp(QMainWindow):
         cc_layout.addWidget(self.connection_status)
         cc_layout.addWidget(url_lbl)
         cc_layout.addWidget(self.api_url_input)
+        cc_layout.addWidget(user_id_lbl)
+        cc_layout.addWidget(self.printer_user_id_input)
+        cc_layout.addWidget(self.pos_worker_status)
         cc_layout.addWidget(connect_btn)
         config_layout.addWidget(conn_card)
 
@@ -778,7 +1090,8 @@ class VulaPrintApp(QMainWindow):
 
         # ── Bottom status strip ───────────────────────────────────
         status_strip = QWidget()
-        status_strip.setFixedHeight(44)
+        status_strip.setMinimumHeight(40)
+        status_strip.setMaximumHeight(52)
         status_strip.setStyleSheet(
             f"background:{self.C_SURFACE}; border-top:1px solid {self.C_BORDER};"
         )
@@ -852,28 +1165,28 @@ class VulaPrintApp(QMainWindow):
         bar_layout.addStretch()
 
         refresh_btn = QPushButton("↻   Refresh")
-        refresh_btn.setFixedSize(110, 36)
+        refresh_btn.setMinimumSize(110, 36)
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh_btn.setStyleSheet(self._btn_secondary())
         refresh_btn.clicked.connect(self.fetch_pending_requests)
         bar_layout.addWidget(refresh_btn)
 
         preview_btn = QPushButton("Preview TSPL")
-        preview_btn.setFixedHeight(36)
+        preview_btn.setMinimumHeight(36)
         preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         preview_btn.setStyleSheet(self._btn_secondary())
         preview_btn.clicked.connect(self.show_tspl_preview)
         bar_layout.addWidget(preview_btn)
 
         visual_btn = QPushButton("⬜ Visual Preview")
-        visual_btn.setFixedHeight(36)
+        visual_btn.setMinimumHeight(36)
         visual_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         visual_btn.setStyleSheet(self._btn_primary())
         visual_btn.clicked.connect(self.show_visual_preview)
         bar_layout.addWidget(visual_btn)
 
         history_btn = QPushButton("History / Reprint")
-        history_btn.setFixedHeight(36)
+        history_btn.setMinimumHeight(36)
         history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         history_btn.setStyleSheet(self._btn_secondary())
         history_btn.clicked.connect(self.show_print_history)
@@ -900,16 +1213,13 @@ class VulaPrintApp(QMainWindow):
             ["ID", "Source", "Created By", "Labels", "Created At", ""]
         )
         hdr = self.requests_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.requests_table.setColumnWidth(0, 52)
-        self.requests_table.setColumnWidth(3, 70)
-        self.requests_table.setColumnWidth(4, 155)
-        self.requests_table.setColumnWidth(5, 110)
+        self.requests_table.setColumnWidth(5, 118)
         self.requests_table.verticalHeader().setVisible(False)
         self.requests_table.setShowGrid(False)
         self.requests_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -956,7 +1266,9 @@ class VulaPrintApp(QMainWindow):
 
         # ── Detail card ──────────────────────────────────────────
         detail_card = QWidget()
-        detail_card.setFixedHeight(130)
+        detail_card.setMinimumHeight(116)
+        detail_card.setMaximumHeight(220)
+        detail_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         detail_card.setStyleSheet(
             f"background:{self.C_SURFACE}; border:1px solid {self.C_BORDER}; border-radius:8px;"
         )
@@ -983,7 +1295,8 @@ class VulaPrintApp(QMainWindow):
         # ── Progress bar ─────────────────────────────────────────
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setMinimumHeight(6)
+        self.progress_bar.setMaximumHeight(10)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet(f"""
             QProgressBar {{
@@ -1003,6 +1316,10 @@ class VulaPrintApp(QMainWindow):
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.fetch_pending_requests)
         self.refresh_timer.start(30000)  # Refresh every 30 seconds
+
+        self.pos_refresh_timer = QTimer()
+        self.pos_refresh_timer.timeout.connect(self.poll_pos_slips)
+        self.pos_refresh_timer.start(max(1, int(self.pos_poll_interval_seconds)) * 1000)
     
     def scan_for_printers(self):
         """Scan for available USB printers."""
@@ -1014,20 +1331,29 @@ class VulaPrintApp(QMainWindow):
     def on_printers_found(self, printers: List[str]):
         """Handle printer scan results."""
         self.printer_combo.clear()
+        self.pos_printer_combo.clear()
         
         if not printers:
             self.printer_combo.addItem("No printers found")
+            self.pos_printer_combo.addItem("No POS printers found")
             self.status_bar.showMessage("No printers found")
         else:
             self.printer_combo.addItem("Select a printer...")
+            self.pos_printer_combo.addItem("Select POS slip printer...")
             for printer in printers:
                 self.printer_combo.addItem(printer)
+                self.pos_printer_combo.addItem(printer)
             self.status_bar.showMessage(f"Found {len(printers)} printer(s)")
 
             if self.last_selected_printer and self.last_selected_printer in printers:
                 index = self.printer_combo.findText(self.last_selected_printer)
                 if index >= 0:
                     self.printer_combo.setCurrentIndex(index)
+
+            if self.last_selected_pos_printer and self.last_selected_pos_printer in printers:
+                pos_index = self.pos_printer_combo.findText(self.last_selected_pos_printer)
+                if pos_index >= 0:
+                    self.pos_printer_combo.setCurrentIndex(pos_index)
     
     def on_printer_selected(self, index: int):
         """Handle printer selection."""
@@ -1054,6 +1380,190 @@ class VulaPrintApp(QMainWindow):
             self.header_printer_status.setStyleSheet(
                 f"color:{self.C_TEXT_DIM}; font-size:10px;"
             )
+
+    def on_pos_printer_selected(self, index: int):
+        """Handle POS printer selection."""
+        if index > 0:
+            self.pos_selected_printer = self.pos_printer_combo.currentText()
+            self.last_selected_pos_printer = self.pos_selected_printer
+            self.save_settings()
+            self._update_pos_worker_status()
+        else:
+            self.pos_selected_printer = None
+            self._update_pos_worker_status()
+
+    def on_printer_user_id_changed(self, text: str):
+        """Persist printer user id for POS queue scoping."""
+        value = text.strip()
+        if value.isdigit() and int(value) > 0:
+            self.printer_user_id = int(value)
+        else:
+            self.printer_user_id = None
+        self.save_settings()
+        self._update_pos_worker_status()
+
+    def _update_pos_worker_status(self, extra_note: Optional[str] = None):
+        """Refresh POS worker readiness indicator."""
+        ready = bool(self.pos_selected_printer and self.printer_user_id)
+        if ready:
+            text = "POS worker ready"
+            if extra_note:
+                text = f"POS worker ready · {extra_note}"
+            self.pos_worker_status.setText(text)
+            self.pos_worker_status.setStyleSheet(
+                f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+        else:
+            text = "POS worker paused"
+            if extra_note:
+                text = f"POS worker paused · {extra_note}"
+            self.pos_worker_status.setText(text)
+            self.pos_worker_status.setStyleSheet(
+                f"background:#2a1f1a; color:{self.C_WARNING}; border:1px solid #5a3b2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+
+    def _pos_headers(self, include_json: bool = False) -> Dict[str, str]:
+        headers = {
+            "X-API-Key": self.api_key,
+            "X-Printer-User-Id": str(self.printer_user_id or ""),
+        }
+        if include_json:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _complete_pos_request(self, request_id: int) -> bool:
+        """Mark a POS request as complete. Returns True when resolved."""
+        try:
+            response = requests.post(
+                f"{self.api_base_url}/admin/api/pos-slips/complete",
+                headers=self._pos_headers(include_json=True),
+                json={"request_id": request_id},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True
+            if response.status_code in (400, 404):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def poll_pos_slips(self):
+        """Poll POS slips and auto-print immediately when available."""
+        if self.pos_print_job and self.pos_print_job.isRunning():
+            return
+        if not self.api_key:
+            self._update_pos_worker_status("Missing PRINTER_API_KEY")
+            return
+        if not self.pos_selected_printer or not self.printer_user_id:
+            self._update_pos_worker_status()
+            return
+        if time.time() < self.pos_backoff_until:
+            return
+
+        if self.pos_completion_retry_ids:
+            retry_ids = sorted(list(self.pos_completion_retry_ids))
+            for req_id in retry_ids:
+                if self._complete_pos_request(req_id):
+                    self.pos_completion_retry_ids.discard(req_id)
+
+        try:
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/pos-slips/pending",
+                headers=self._pos_headers(),
+                timeout=10,
+            )
+        except Exception as e:
+            self._register_pos_backoff()
+            self._update_pos_worker_status("POS API network retry")
+            self.status_bar.showMessage(f"POS poll error: {e}")
+            return
+
+        if response.status_code in (401, 503):
+            self._update_pos_worker_status(f"POS API error {response.status_code}")
+            self.status_bar.showMessage(f"POS worker stopped: auth/config error {response.status_code}")
+            return
+        if response.status_code == 400:
+            self._update_pos_worker_status("Invalid PRINTER_USER_ID")
+            self.status_bar.showMessage("POS worker stopped: invalid or missing printer user id")
+            return
+        if response.status_code != 200:
+            self._register_pos_backoff()
+            self._update_pos_worker_status(f"POS API error {response.status_code}")
+            self.status_bar.showMessage(f"POS poll failed: {response.status_code}")
+            return
+
+        self.pos_backoff_seconds = 1
+        self.pos_backoff_until = 0.0
+        self._update_pos_worker_status("POS API connected")
+        pending_payload = response.json()
+        pending = pending_payload if isinstance(pending_payload, list) else []
+        pending = sorted(pending, key=lambda r: str(r.get("created_at", "")))
+        self.last_successful_pos_poll_at = datetime.now()
+
+        for request in pending:
+            req_id = int(request.get("id", 0) or 0)
+            if req_id <= 0:
+                continue
+            if req_id in self.pos_in_flight_ids:
+                continue
+
+            self.pos_in_flight_ids.add(req_id)
+            self._start_pos_print(req_id)
+            return
+
+    def _register_pos_backoff(self):
+        """Apply exponential backoff for transient POS API failures."""
+        self.pos_backoff_until = time.time() + min(self.pos_backoff_seconds, 30)
+        self.pos_backoff_seconds = min(self.pos_backoff_seconds * 2, 30)
+
+    def _start_pos_print(self, request_id: int):
+        """Fetch detail payload and start POS print job."""
+        try:
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/pos-slips/request/{request_id}",
+                headers=self._pos_headers(),
+                timeout=10,
+            )
+        except Exception as e:
+            self.pos_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(f"POS detail error #{request_id}: {e}")
+            return
+
+        if response.status_code == 404:
+            self.pos_in_flight_ids.discard(request_id)
+            return
+        if response.status_code != 200:
+            self.pos_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(f"POS detail failed #{request_id}: {response.status_code}")
+            return
+
+        detail = response.json()
+        self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, detail)
+        self.pos_print_job.finished.connect(lambda s, m: self._on_pos_print_finished(s, m, request_id))
+        self.pos_print_job.start()
+        self.status_bar.showMessage(f"Printing POS slip #{request_id}...")
+
+    def _on_pos_print_finished(self, success: bool, message: str, request_id: int):
+        """Handle POS print completion and completion API semantics."""
+        self.pos_print_job = None
+
+        if success:
+            self.last_successful_pos_print_at = datetime.now()
+            complete_ok = self._complete_pos_request(request_id)
+            if not complete_ok:
+                self.pos_completion_retry_ids.add(request_id)
+                self.status_bar.showMessage(
+                    f"POS slip #{request_id} printed; completion retry scheduled"
+                )
+            else:
+                self.status_bar.showMessage(f"POS slip #{request_id} printed and completed")
+        else:
+            self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
+
+        self.pos_in_flight_ids.discard(request_id)
     
     def calibrate_printer(self):
         """Calibrate printer and print test label."""
@@ -1527,6 +2037,95 @@ class VulaPrintApp(QMainWindow):
             QMessageBox.critical(self, "Test Label Failed", message)
         self.status_bar.showMessage("Ready")
 
+    def _build_sample_pos_payload(self) -> Dict[str, Any]:
+        """Build a six-item sample payload for POS printer testing."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "request": {
+                "id": 999999,
+                "invoice_number": "TEST-POS-0001",
+                "created_at": now,
+                "payment_type": "card",
+            },
+            "business": {
+                "brand_name": "Vula! Print Demo Store",
+                "phone": "+27 11 555 0101",
+                "email": "info@vula.local",
+                "vat_number": "4555555555",
+                "address_line1": "1 Orange Street",
+                "address_line2": "Unit B",
+                "city": "Johannesburg",
+                "province": "Gauteng",
+                "postal_code": "2000",
+                "country": "ZA",
+            },
+            "store": {
+                "name": "Sandton Demo Counter",
+                "address": "123 Example Ave\nSandton\nGauteng\n2196\nZA",
+                "phone": "+27 11 555 0111",
+                "email": "sandton@vula.local",
+            },
+            "cashier_username": "printer_test",
+            "customer_email": "",
+            "footer_note": "Test print completed. Please verify alignment and cutter.",
+            "items": [
+                {"qty": 1, "title": "Premium Hoodie", "variant_label": "Black / M", "sku": "HD-BLK-M", "unit_price_cents": 89900, "line_tax_cents": 11726, "line_total_cents": 89900},
+                {"qty": 2, "title": "Athletic Socks", "variant_label": "White / L", "sku": "SOCK-WHT-L", "unit_price_cents": 12900, "line_tax_cents": 3366, "line_total_cents": 25800},
+                {"qty": 1, "title": "Sports Bottle", "variant_label": "750ml", "sku": "BOT-750", "unit_price_cents": 14900, "line_tax_cents": 1943, "line_total_cents": 14900},
+                {"qty": 1, "title": "Running Cap", "variant_label": "Grey", "sku": "CAP-GRY", "unit_price_cents": 19900, "line_tax_cents": 2596, "line_total_cents": 19900},
+                {"qty": 1, "title": "Compression Tee", "variant_label": "Navy / XL", "sku": "TEE-NVY-XL", "unit_price_cents": 34900, "line_tax_cents": 4552, "line_total_cents": 34900},
+                {"qty": 1, "title": "Gift Wrap", "variant_label": "Standard", "sku": "WRAP-STD", "unit_price_cents": 2500, "line_tax_cents": 326, "line_total_cents": 2500},
+            ],
+            "totals": {
+                "vat_bps": 1500,
+                "tax_cents": 24509,
+                "subtotal_before_discount_cents": 198900,
+                "manual_discount_cents": 20000,
+                "voucher_discount_cents": 0,
+                "subtotal_cents": 178900,
+                "total_cents": 203409,
+                "currency": "ZAR",
+            },
+        }
+
+    def print_test_pos_slip(self):
+        """Print a six-item sample POS slip for cutter/alignment verification."""
+        if not self.pos_selected_printer:
+            QMessageBox.warning(self, "No POS Printer", "Please select a POS slip printer first.")
+            return
+        if self.pos_print_job and self.pos_print_job.isRunning():
+            QMessageBox.information(self, "POS Print Busy", "A POS slip is already printing.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Test POS Printer",
+            "This prints a sample POS slip with 6 items and performs paper cut.\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        sample_payload = self._build_sample_pos_payload()
+        self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, sample_payload)
+        self.pos_print_job.finished.connect(self._on_test_pos_finished)
+        self.pos_print_job.start()
+        self.status_bar.showMessage("Printing sample POS slip...")
+
+    def _on_test_pos_finished(self, success: bool, message: str):
+        self.pos_print_job = None
+        if success:
+            QMessageBox.information(
+                self,
+                "POS Test Printed",
+                "Sample POS slip printed and cut.\n\n"
+                "Verify text clarity, spacing, and cutter operation.",
+            )
+        else:
+            QMessageBox.critical(self, "POS Test Failed", message)
+        self.status_bar.showMessage("Ready")
+
     # ─────────────────────────────────────────────────────────────
     # Print History & Reprint
     # ─────────────────────────────────────────────────────────────
@@ -1746,7 +2345,12 @@ class _VisualPreviewDialog(QDialog):
                  color_surface, color_orange):
         super().__init__(parent)
         self.setWindowTitle(f"Visual Label Preview — Request #{request_id}")
-        self.resize(860, 680)
+        if parent and hasattr(parent, "_dialog_size"):
+            size = parent._dialog_size(0.8, 0.86, 700, 520, 1120, 900)
+            self.resize(size)
+            self.setMinimumSize(700, 520)
+        else:
+            self.resize(860, 680)
         self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
 
         self._items    = items
@@ -1882,7 +2486,12 @@ class _TextDialog(QDialog):
                  color_bg, color_text, color_border, color_surface, color_orange):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(820, 640)
+        if parent and hasattr(parent, "_dialog_size"):
+            size = parent._dialog_size(0.76, 0.82, 640, 460, 1040, 860)
+            self.resize(size)
+            self.setMinimumSize(640, 460)
+        else:
+            self.resize(820, 640)
         self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
 
         layout = QVBoxLayout(self)
@@ -1906,7 +2515,7 @@ class _TextDialog(QDialog):
         layout.addWidget(text_area, stretch=1)
 
         close_btn = QPushButton("Close")
-        close_btn.setFixedHeight(34)
+        close_btn.setMinimumHeight(34)
         close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
         close_btn.setStyleSheet(
             f"QPushButton {{ background:{color_orange}; color:#000; border:none;"
@@ -1928,7 +2537,12 @@ class _HistoryDialog(QDialog):
                  color_surface, color_surface2, color_orange, color_orange_hi, color_orange_dim):
         super().__init__(parent)
         self.setWindowTitle("Print History")
-        self.resize(760, 520)
+        if parent and hasattr(parent, "_dialog_size"):
+            size = parent._dialog_size(0.72, 0.72, 620, 440, 980, 800)
+            self.resize(size)
+            self.setMinimumSize(620, 440)
+        else:
+            self.resize(760, 520)
         self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
         self._on_reprint = on_reprint
 
@@ -2009,7 +2623,7 @@ class _HistoryDialog(QDialog):
                 row_layout.addLayout(info_layout, stretch=1)
 
                 reprint_btn = QPushButton("Reprint")
-                reprint_btn.setFixedSize(80, 30)
+                reprint_btn.setMinimumSize(88, 32)
                 reprint_btn.setCursor(
                     __import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor
                 )
@@ -2026,7 +2640,7 @@ class _HistoryDialog(QDialog):
             layout.addWidget(scroll, stretch=1)
 
         close_btn = QPushButton("Close")
-        close_btn.setFixedHeight(34)
+        close_btn.setMinimumHeight(34)
         close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
         close_btn.setStyleSheet(
             f"QPushButton {{ background:{color_orange}; color:#000; border:none;"
@@ -2050,7 +2664,12 @@ class _UpdateDialog(QDialog):
                  color_bg, color_text, color_border, color_surface, color_orange):
         super().__init__(parent)
         self.setWindowTitle("Update App")
-        self.resize(760, 480)
+        if parent and hasattr(parent, "_dialog_size"):
+            size = parent._dialog_size(0.72, 0.7, 620, 420, 980, 760)
+            self.resize(size)
+            self.setMinimumSize(620, 420)
+        else:
+            self.resize(760, 480)
         self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
         self._script_path = script_path
         self._process: Optional[QProcess] = None
@@ -2085,7 +2704,7 @@ class _UpdateDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self._close_btn = QPushButton("Close")
-        self._close_btn.setFixedHeight(34)
+        self._close_btn.setMinimumHeight(34)
         self._close_btn.setEnabled(False)  # Only enabled after script finishes
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.setStyleSheet(
