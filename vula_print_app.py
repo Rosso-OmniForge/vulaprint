@@ -567,6 +567,118 @@ class POSSlipPrintJob(QThread):
             self.finished.emit(False, f"POS slip print failed: {e}")
 
 
+class POSEODReportPrintJob(QThread):
+    """Background thread for printing receipt-width POS EOD reports (ESC/POS)."""
+
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, printer_device: str, detail_payload: Dict[str, Any]):
+        super().__init__()
+        self.printer_device = printer_device
+        self.detail_payload = detail_payload
+
+    @staticmethod
+    def _cents_to_amount(cents: int) -> str:
+        value = Decimal(int(cents)) / Decimal(100)
+        value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{value:.2f}"
+
+    @staticmethod
+    def _esc(*values: int) -> bytes:
+        return bytes(values)
+
+    @staticmethod
+    def _line_sep(width: int = 48, ch: str = "-") -> str:
+        return ch * width
+
+    @staticmethod
+    def _col2(left: str, right: str, width: int = 48) -> str:
+        l = str(left or "")
+        r = str(right or "")
+        space = max(1, width - len(l) - len(r))
+        return f"{l}{' ' * space}{r}"
+
+    def _txt(self, text: str = "") -> bytes:
+        return (text + "\n").encode("ascii", errors="replace")
+
+    def _build_receipt_bytes(self) -> bytes:
+        req = self.detail_payload.get("request", {})
+        report = self.detail_payload.get("report_data", {})
+        payment = report.get("payment_split", {})
+
+        out = bytearray()
+        ESC = 0x1B
+        GS = 0x1D
+        LF = 0x0A
+
+        out += self._esc(ESC, 0x40)
+        out += self._esc(ESC, 0x61, 0x01)
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt("POS END OF DAY")
+        out += self._esc(ESC, 0x45, 0x00)
+        out += self._txt(str(report.get("date", "")))
+        out += self._txt(str(report.get("timezone", "")))
+
+        out += self._esc(ESC, 0x61, 0x00)
+        out += self._txt(self._line_sep())
+        out += self._txt(self._col2("Request:", str(req.get("id", ""))))
+        out += self._txt(self._col2("Source:", str(req.get("source", "manual"))))
+        out += self._txt(self._line_sep())
+
+        out += self._txt(self._col2("Invoices:", str(int(report.get("invoices_created", 0) or 0))))
+        out += self._txt(self._col2("Items Sold:", str(int(report.get("items_sold", 0) or 0))))
+        out += self._txt(self._col2("Sales:", f"R {self._cents_to_amount(int(report.get('total_sales_cents', 0) or 0))}"))
+        out += self._txt(self._col2("COGS:", f"R {self._cents_to_amount(int(report.get('total_cost_cents', 0) or 0))}"))
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt(self._col2("Gross Profit:", f"R {self._cents_to_amount(int(report.get('total_profit_cents', 0) or 0))}"))
+        out += self._esc(ESC, 0x45, 0x00)
+
+        cash = payment.get("cash", {})
+        card = payment.get("card", {})
+        out += self._txt(self._line_sep())
+        out += self._txt("Payment Split")
+        out += self._txt(self._col2("Cash:", f"R {self._cents_to_amount(int(cash.get('sales_cents', 0) or 0))}"))
+        out += self._txt(self._col2("  Invoices", str(int(cash.get("invoices", 0) or 0))))
+        out += self._txt(self._col2("Card:", f"R {self._cents_to_amount(int(card.get('sales_cents', 0) or 0))}"))
+        out += self._txt(self._col2("  Invoices", str(int(card.get("invoices", 0) or 0))))
+
+        staff_rows = report.get("staff", []) or []
+        if staff_rows:
+            out += self._txt(self._line_sep())
+            out += self._txt("Top Staff")
+            for row in staff_rows[:8]:
+                name = str(row.get("name", ""))[:20]
+                sales_cents = int(row.get("sales_cents", 0) or 0)
+                out += self._txt(self._col2(name, f"R {self._cents_to_amount(sales_cents)}"))
+
+        out += bytes([LF, LF, LF])
+        out += self._esc(GS, 0x56, 0x41, 0x00)
+        return bytes(out)
+
+    def run(self):
+        try:
+            payload = self._build_receipt_bytes()
+            try:
+                with open(self.printer_device, "wb") as printer:
+                    printer.write(payload)
+            except PermissionError:
+                self.finished.emit(
+                    False,
+                    f"Permission denied: cannot write to {self.printer_device}.\n\n"
+                    f"The printer device requires the user to be in the 'lp' group.\n"
+                    f"Re-run the install script to fix this automatically, or run:\n"
+                    f"  sudo usermod -aG lp $USER  (then log out and back in)",
+                )
+                return
+            except Exception as e:
+                self.finished.emit(False, f"POS EOD printer error: {e}")
+                return
+
+            self.finished.emit(True, "POS EOD report printed successfully")
+        except Exception as e:
+            self.finished.emit(False, f"POS EOD print failed: {e}")
+
+
 class VulaPrintApp(QMainWindow):
     """Main application window."""
     
@@ -590,8 +702,11 @@ class VulaPrintApp(QMainWindow):
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
         self.pos_print_job: Optional[POSSlipPrintJob] = None
+        self.pos_eod_print_job: Optional[POSEODReportPrintJob] = None
         self.pos_in_flight_ids: set[int] = set()
         self.pos_completion_retry_ids: set[int] = set()
+        self.pos_eod_in_flight_ids: set[int] = set()
+        self.pos_eod_completion_retry_ids: set[int] = set()
         self.pos_backoff_seconds = 1
         self.pos_backoff_until = 0.0
         self.last_successful_pos_poll_at: Optional[datetime] = None
@@ -1450,9 +1565,41 @@ class VulaPrintApp(QMainWindow):
         except Exception:
             return False
 
+    def _complete_pos_eod_request(self, request_id: int) -> bool:
+        """Mark a POS EOD report request as complete. Returns True when resolved."""
+        try:
+            response = requests.post(
+                f"{self.api_base_url}/admin/api/pos-eod-reports/complete",
+                headers=self._pos_headers(include_json=True),
+                json={"request_id": request_id},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True
+            if response.status_code in (400, 404):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _ensure_latest_pos_eod_report(self) -> None:
+        """Ask backend to auto-queue/update previous-day EOD report for this printer user."""
+        try:
+            requests.post(
+                f"{self.api_base_url}/admin/api/pos-eod-reports/ensure-latest",
+                headers=self._pos_headers(include_json=True),
+                json={},
+                timeout=8,
+            )
+        except Exception:
+            # Best effort only; polling pending queue remains source of truth.
+            return
+
     def poll_pos_slips(self):
         """Poll POS slips and auto-print immediately when available."""
         if self.pos_print_job and self.pos_print_job.isRunning():
+            return
+        if self.pos_eod_print_job and self.pos_eod_print_job.isRunning():
             return
         if not self.api_key:
             self._update_pos_worker_status("Missing PRINTER_API_KEY")
@@ -1468,6 +1615,11 @@ class VulaPrintApp(QMainWindow):
             for req_id in retry_ids:
                 if self._complete_pos_request(req_id):
                     self.pos_completion_retry_ids.discard(req_id)
+        if self.pos_eod_completion_retry_ids:
+            retry_ids = sorted(list(self.pos_eod_completion_retry_ids))
+            for req_id in retry_ids:
+                if self._complete_pos_eod_request(req_id):
+                    self.pos_eod_completion_retry_ids.discard(req_id)
 
         try:
             response = requests.get(
@@ -1512,6 +1664,35 @@ class VulaPrintApp(QMainWindow):
 
             self.pos_in_flight_ids.add(req_id)
             self._start_pos_print(req_id)
+            return
+
+        self._ensure_latest_pos_eod_report()
+
+        # If no POS slips are waiting, process queued EOD reports
+        try:
+            eod_response = requests.get(
+                f"{self.api_base_url}/admin/api/pos-eod-reports/pending",
+                headers=self._pos_headers(),
+                timeout=10,
+            )
+        except Exception:
+            return
+
+        if eod_response.status_code != 200:
+            return
+
+        eod_payload = eod_response.json()
+        eod_pending = eod_payload if isinstance(eod_payload, list) else []
+        eod_pending = sorted(eod_pending, key=lambda r: str(r.get("created_at", "")))
+
+        for request in eod_pending:
+            req_id = int(request.get("id", 0) or 0)
+            if req_id <= 0:
+                continue
+            if req_id in self.pos_eod_in_flight_ids:
+                continue
+            self.pos_eod_in_flight_ids.add(req_id)
+            self._start_pos_eod_print(req_id)
             return
 
     def _register_pos_backoff(self):
@@ -1564,6 +1745,51 @@ class VulaPrintApp(QMainWindow):
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
 
         self.pos_in_flight_ids.discard(request_id)
+
+    def _start_pos_eod_print(self, request_id: int):
+        """Fetch EOD report payload and start receipt print job."""
+        try:
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/pos-eod-reports/request/{request_id}",
+                headers=self._pos_headers(),
+                timeout=10,
+            )
+        except Exception as e:
+            self.pos_eod_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(f"POS EOD detail error #{request_id}: {e}")
+            return
+
+        if response.status_code == 404:
+            self.pos_eod_in_flight_ids.discard(request_id)
+            return
+        if response.status_code != 200:
+            self.pos_eod_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(f"POS EOD detail failed #{request_id}: {response.status_code}")
+            return
+
+        detail = response.json()
+        self.pos_eod_print_job = POSEODReportPrintJob(self.pos_selected_printer, detail)
+        self.pos_eod_print_job.finished.connect(lambda s, m: self._on_pos_eod_print_finished(s, m, request_id))
+        self.pos_eod_print_job.start()
+        self.status_bar.showMessage(f"Printing POS EOD report #{request_id}...")
+
+    def _on_pos_eod_print_finished(self, success: bool, message: str, request_id: int):
+        """Handle POS EOD receipt print completion semantics."""
+        self.pos_eod_print_job = None
+
+        if success:
+            complete_ok = self._complete_pos_eod_request(request_id)
+            if not complete_ok:
+                self.pos_eod_completion_retry_ids.add(request_id)
+                self.status_bar.showMessage(
+                    f"POS EOD report #{request_id} printed; completion retry scheduled"
+                )
+            else:
+                self.status_bar.showMessage(f"POS EOD report #{request_id} printed and completed")
+        else:
+            self.status_bar.showMessage(f"POS EOD report #{request_id} failed: {message}")
+
+        self.pos_eod_in_flight_ids.discard(request_id)
     
     def calibrate_printer(self):
         """Calibrate printer and print test label."""
